@@ -60,7 +60,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   deploy:
-    name: Deploy to Render (API + Poll)
+    name: Deploy to Render (API + Poll sin heredocs)
     needs: release
     runs-on: ubuntu-latest
     if: success()
@@ -72,12 +72,9 @@ jobs:
           RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
         run: |
           set -euo pipefail
-
-          # Validaciones mínimas
           test -n "${RENDER_API_KEY:-}"    || { echo "Falta RENDER_API_KEY"; exit 1; }
           test -n "${RENDER_SERVICE_ID:-}" || { echo "Falta RENDER_SERVICE_ID"; exit 1; }
 
-          # Disparar deploy y capturar status + cuerpo
           HTTP_CODE=$(mktemp)
           RESP_BODY=$(mktemp)
 
@@ -87,15 +84,10 @@ jobs:
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d '{}' \
-            -w "%{http_code}" -o "$RESP_BODY" > "$HTTP_CODE" || {
-              echo "❌ curl falló al invocar la API de Render"
-              exit 1
-            }
+            -w "%{http_code}" -o "$RESP_BODY" > "$HTTP_CODE"
 
           code=$(cat "$HTTP_CODE")
           echo "HTTP code: $code"
-
-          # Mostrar un resumen del cuerpo por si hay error
           echo "Respuesta (primeras 400 chars):"
           head -c 400 "$RESP_BODY" || true
           echo
@@ -105,31 +97,16 @@ jobs:
             exit 1
           fi
 
-          # Verificamos que el cuerpo no esté vacío
-          if [ ! -s "$RESP_BODY" ]; then
-            echo "❌ Respuesta vacía de la API de Render."
-            exit 1
-          fi
-
-          # Extraer deploy_id con Python (solo si es JSON válido)
-          DEPLOY_ID=$(python - <<'PY' "$RESP_BODY"
-          import sys, json
-          p = sys.argv[1]
-          with open(p, 'rb') as f:
-              data = json.load(f)
-          print(data.get("id",""))
-          PY
-          )
+          # Extraer deploy_id sin heredoc
+          DEPLOY_ID=$(python -c "import sys,json; print(json.load(open('$RESP_BODY','rb')).get('id',''))")
           if [ -z "$DEPLOY_ID" ]; then
-            echo "❌ No se pudo extraer 'id' del JSON de respuesta."
-            echo "Cuerpo completo:"
+            echo '❌ No se pudo extraer "id" del JSON de respuesta.'
             cat "$RESP_BODY"
             exit 1
           fi
 
           echo "deploy_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
           echo "🚀 Deploy disparado: $DEPLOY_ID"
-
 
       - name: Wait until LIVE
         env:
@@ -155,36 +132,19 @@ jobs:
             RESP_BODY=$(mktemp)
 
             curl -sS "https://api.render.com/v1/deploys/${DEPLOY_ID}" \
-              -H "Authorization: Bearer ${RENDER_API_KEY }}" \
+              -H "Authorization: Bearer ${RENDER_API_KEY}" \
               -H "Accept: application/json" \
-              -w "%{http_code}" -o "$RESP_BODY" > "$HTTP_CODE" || {
-                echo "❌ curl falló al consultar el deploy"
-                exit 1
-              }
+              -w "%{http_code}" -o "$RESP_BODY" > "$HTTP_CODE"
 
             code=$(cat "$HTTP_CODE")
             if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
               echo "❌ Status no-2xx al consultar deploy ($code)"
-              head -c 400 "$RESP_BODY" || true
+              head -c 600 "$RESP_BODY" || true
               exit 1
             fi
 
-            STATUS=$(python - <<'PY' "$RESP_BODY"
-            import sys, json
-            p=sys.argv[1]
-            with open(p,'rb') as f:
-                data=json.load(f)
-            print(data.get("status",""))
-            PY
-            )
-                        PHASE=$(python - <<'PY' "$RESP_BODY"
-            import sys, json
-            p=sys.argv[1]
-            with open(p,'rb') as f:
-                data=json.load(f)
-            print(data.get("phase",""))
-            PY
-            )
+            STATUS=$(python -c "import sys,json; print(json.load(open('$RESP_BODY','rb')).get('status',''))")
+            PHASE=$(python -c "import sys,json; print(json.load(open('$RESP_BODY','rb')).get('phase',''))")
             echo "⏳ Estado: $STATUS | Fase: $PHASE (t=${ELAPSED}s)"
 
             if [ "$STATUS" = "live" ]; then
@@ -208,3 +168,4 @@ jobs:
               exit 1
             fi
           done
+
