@@ -1,29 +1,148 @@
 name: CD Release Pipeline
 permissions:
   contents: write
+
 on:
   push:
     tags:
-      - 'v*.*.*'  # Trigger on version tags like v1.0.0
+      - 'v*.*.*'  # ej: v1.0.0
+
+concurrency:
+  group: cd-render-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-    create-github-release:
-        runs-on: ubuntu-latest
-        
-        steps:
-        - name: Checkout code
-          uses: actions/checkout@v4
+  build-and-test:
+    name: Build & Test (FastAPI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-        - name: Create Release
-          id: create_release
-          uses: actions/create-release@v1.1.4
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          with:
-            tag_name: ${{ github.ref }}
-            release_name: Release ${{ github.ref }}
-            body: |
-              Nueva version liberada: ${{ github.ref }}
-              Este release fue generado automáticamente por el pipeline de CD.
-            draft: false
-            prerelease: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          if command -v pytest >/dev/null 2>&1; then
+            pytest -q
+          else
+            echo "pytest no instalado"; exit 1
+          fi
+
+  release:
+    name: Create GitHub Release
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Usa softprops/action-gh-release (evita set-output deprecado)
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: |
+            Nueva versión liberada: ${{ github.ref_name }}
+            Release generado automáticamente por el pipeline de CD.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    name: Deploy to Render (API + Poll)
+    needs: release
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Trigger deploy
+        id: trigger
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${RENDER_API_KEY:-}" || { echo "Falta RENDER_API_KEY"; exit 1; }
+          test -n "${RENDER_SERVICE_ID:-}" || { echo "Falta RENDER_SERVICE_ID"; exit 1; }
+
+          # Dispara un deploy (Render leerá render.yaml de este commit/tag si existe)
+          DEPLOY_JSON=$(curl -fsS -X POST \
+            "https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys" \
+            -H "Authorization: Bearer ${RENDER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+
+          # Extraer deploy_id sin jq
+          DEPLOY_ID=$(echo "$DEPLOY_JSON" | python - <<'PY'
+          import sys, json
+          print(json.load(sys.stdin)["id"])
+          PY
+          )
+          echo "deploy_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          echo "🚀 Deploy disparado: $DEPLOY_ID"
+
+      - name: Wait until LIVE
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          DEPLOY_ID: ${{ steps.trigger.outputs.deploy_id }}
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_ID:-}" || { echo "No se obtuvo DEPLOY_ID"; exit 1; }
+
+          TIMEOUT=1200    # 20 minutos
+          INTERVAL=10     # segundos
+          ELAPSED=0
+
+          is_terminal() {
+            case "$1" in
+              live|deactivated|failed|canceled) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          while : ; do
+            STATUS_JSON=$(curl -fsS "https://api.render.com/v1/deploys/${DEPLOY_ID}" \
+              -H "Authorization: Bearer ${RENDER_API_KEY}")
+            STATUS=$(echo "$STATUS_JSON" | python - <<'PY'
+          import sys, json
+          print(json.load(sys.stdin)["status"])
+          PY
+          )
+                      PHASE=$(echo "$STATUS_JSON" | python - <<'PY'
+          import sys, json
+          print(json.load(sys.stdin).get("phase",""))
+          PY
+          )
+            echo "⏳ Estado: $STATUS  | Fase: $PHASE  (t=${ELAPSED}s)"
+
+            if [ "$STATUS" = "live" ]; then
+              echo "✅ Deploy LIVE"
+              exit 0
+            fi
+
+            if is_terminal "$STATUS"; then
+              echo "❌ Deploy en estado terminal: $STATUS"
+              echo "Detalle:"
+              echo "$STATUS_JSON"
+              exit 1
+            fi
+
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED+INTERVAL))
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "⏱️ Timeout esperando que el deploy quede LIVE"
+              echo "Último estado:"
+              echo "$STATUS_JSON"
+              exit 1
+            fi
+          done
