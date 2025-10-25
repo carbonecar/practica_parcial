@@ -1,0 +1,29 @@
+name: CD Release Pipeline
+permissions:
+  contents: write
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Trigger on version tags like v1.0.0
+
+jobs:
+    create-github-release:
+        runs-on: ubuntu-latest
+        
+        steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Create Release
+          id: create_release
+          uses: actions/create-release@v1.1.4
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          with:
+            tag_name: ${{ github.ref }}
+            release_name: Release ${{ github.ref }}
+            body: |
+              Nueva version liberada: ${{ github.ref }}
+              Este release fue generado automáticamente por el pipeline de CD.
+            draft: false
+            prerelease: false
