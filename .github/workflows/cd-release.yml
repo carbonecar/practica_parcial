@@ -72,24 +72,64 @@ jobs:
           RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
         run: |
           set -euo pipefail
-          test -n "${RENDER_API_KEY:-}" || { echo "Falta RENDER_API_KEY"; exit 1; }
+
+          # Validaciones mínimas
+          test -n "${RENDER_API_KEY:-}"    || { echo "Falta RENDER_API_KEY"; exit 1; }
           test -n "${RENDER_SERVICE_ID:-}" || { echo "Falta RENDER_SERVICE_ID"; exit 1; }
 
-          # Dispara un deploy (Render leerá render.yaml de este commit/tag si existe)
-          DEPLOY_JSON=$(curl -fsS -X POST \
+          # Disparar deploy y capturar status + cuerpo
+          HTTP_CODE=$(mktemp)
+          RESP_BODY=$(mktemp)
+
+          curl -sS -X POST \
             "https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys" \
             -H "Authorization: Bearer ${RENDER_API_KEY}" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            -d '{}')
+            -d '{}' \
+            -w "%{http_code}" -o "$RESP_BODY" > "$HTTP_CODE" || {
+              echo "❌ curl falló al invocar la API de Render"
+              exit 1
+            }
 
-          # Extraer deploy_id sin jq
-          DEPLOY_ID=$(echo "$DEPLOY_JSON" | python - <<'PY'
+          code=$(cat "$HTTP_CODE")
+          echo "HTTP code: $code"
+
+          # Mostrar un resumen del cuerpo por si hay error
+          echo "Respuesta (primeras 400 chars):"
+          head -c 400 "$RESP_BODY" || true
+          echo
+
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "❌ La API devolvió un status no-2xx. Abortando."
+            exit 1
+          fi
+
+          # Verificamos que el cuerpo no esté vacío
+          if [ ! -s "$RESP_BODY" ]; then
+            echo "❌ Respuesta vacía de la API de Render."
+            exit 1
+          fi
+
+          # Extraer deploy_id con Python (solo si es JSON válido)
+          DEPLOY_ID=$(python - <<'PY' "$RESP_BODY"
           import sys, json
-          print(json.load(sys.stdin)["id"])
+          p = sys.argv[1]
+          with open(p, 'rb') as f:
+              data = json.load(f)
+          print(data.get("id",""))
           PY
           )
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "❌ No se pudo extraer 'id' del JSON de respuesta."
+            echo "Cuerpo completo:"
+            cat "$RESP_BODY"
+            exit 1
+          fi
+
           echo "deploy_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
           echo "🚀 Deploy disparado: $DEPLOY_ID"
+
 
       - name: Wait until LIVE
         env:
@@ -100,7 +140,7 @@ jobs:
           test -n "${DEPLOY_ID:-}" || { echo "No se obtuvo DEPLOY_ID"; exit 1; }
 
           TIMEOUT=1200    # 20 minutos
-          INTERVAL=10     # segundos
+          INTERVAL=10
           ELAPSED=0
 
           is_terminal() {
@@ -111,19 +151,41 @@ jobs:
           }
 
           while : ; do
-            STATUS_JSON=$(curl -fsS "https://api.render.com/v1/deploys/${DEPLOY_ID}" \
-              -H "Authorization: Bearer ${RENDER_API_KEY}")
-            STATUS=$(echo "$STATUS_JSON" | python - <<'PY'
-          import sys, json
-          print(json.load(sys.stdin)["status"])
-          PY
-          )
-                      PHASE=$(echo "$STATUS_JSON" | python - <<'PY'
-          import sys, json
-          print(json.load(sys.stdin).get("phase",""))
-          PY
-          )
-            echo "⏳ Estado: $STATUS  | Fase: $PHASE  (t=${ELAPSED}s)"
+            HTTP_CODE=$(mktemp)
+            RESP_BODY=$(mktemp)
+
+            curl -sS "https://api.render.com/v1/deploys/${DEPLOY_ID}" \
+              -H "Authorization: Bearer ${RENDER_API_KEY }}" \
+              -H "Accept: application/json" \
+              -w "%{http_code}" -o "$RESP_BODY" > "$HTTP_CODE" || {
+                echo "❌ curl falló al consultar el deploy"
+                exit 1
+              }
+
+            code=$(cat "$HTTP_CODE")
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "❌ Status no-2xx al consultar deploy ($code)"
+              head -c 400 "$RESP_BODY" || true
+              exit 1
+            fi
+
+            STATUS=$(python - <<'PY' "$RESP_BODY"
+            import sys, json
+            p=sys.argv[1]
+            with open(p,'rb') as f:
+                data=json.load(f)
+            print(data.get("status",""))
+            PY
+            )
+                        PHASE=$(python - <<'PY' "$RESP_BODY"
+            import sys, json
+            p=sys.argv[1]
+            with open(p,'rb') as f:
+                data=json.load(f)
+            print(data.get("phase",""))
+            PY
+            )
+            echo "⏳ Estado: $STATUS | Fase: $PHASE (t=${ELAPSED}s)"
 
             if [ "$STATUS" = "live" ]; then
               echo "✅ Deploy LIVE"
@@ -132,8 +194,8 @@ jobs:
 
             if is_terminal "$STATUS"; then
               echo "❌ Deploy en estado terminal: $STATUS"
-              echo "Detalle:"
-              echo "$STATUS_JSON"
+              echo "Detalle (primeras 600 chars):"
+              head -c 600 "$RESP_BODY" || true
               exit 1
             fi
 
@@ -141,8 +203,8 @@ jobs:
             ELAPSED=$((ELAPSED+INTERVAL))
             if [ $ELAPSED -ge $TIMEOUT ]; then
               echo "⏱️ Timeout esperando que el deploy quede LIVE"
-              echo "Último estado:"
-              echo "$STATUS_JSON"
+              echo "Última respuesta:"
+              head -c 600 "$RESP_BODY" || true
               exit 1
             fi
           done
